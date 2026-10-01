@@ -5,7 +5,7 @@ const path = require('path');
 const axios = require('axios');
 const sharp = require('sharp');
 const { Logger } = require('./logger');
-const { runFFmpeg, checkFFmpeg, ffmpegInstallHint } = require('./ffmpeg');
+const { runFFmpeg, getMediaDuration, checkFFmpeg, ffmpegInstallHint } = require('./ffmpeg');
 const { MediaGenerationService } = require('./media-generation-service');
 
 class AIVideoGenerator {
@@ -13,6 +13,7 @@ class AIVideoGenerator {
     this.logger = new Logger('AIVideoGenerator');
     const resolvedCredentials = credentials?.credentials || credentials || {};
     this.db = options.db || null;
+    this.getMediaDuration = options.getMediaDuration || getMediaDuration;
     this.lastVideoResult = null;
     this.lastNarrationResult = null;
     
@@ -508,7 +509,7 @@ class AIVideoGenerator {
       }
 
       const videoPath = outputPath.replace('.mp4', '_visual.mp4');
-      const duration = this.calculateScriptDuration(script);
+      const duration = await this.resolveSlideshowDuration(script, audioPath);
       await this.renderSlidesToVideo(stills, duration, videoPath);
 
       // Add audio
@@ -521,13 +522,23 @@ class AIVideoGenerator {
     }
   }
 
+  async resolveSlideshowDuration(script, audioPath) {
+    try {
+      return (await this.getMediaDuration(audioPath)) + 0.5;
+    } catch (error) {
+      this.logger.warn(`Could not read narration duration, falling back to word-count estimate: ${error.message}`);
+      return this.calculateScriptDuration(script);
+    }
+  }
+
   async renderSlidesToVideo(stills, totalDuration, videoPath) {
     if (stills.length === 0) {
       throw new Error('No slides to render');
     }
 
     const fade = 0.5;
-    const perSlide = Math.max(2, totalDuration / stills.length);
+    const overlapDuration = fade * Math.max(0, stills.length - 1);
+    const perSlide = Math.max(2, (totalDuration + overlapDuration) / stills.length);
 
     const args = ['-y'];
     for (const still of stills) {

@@ -132,30 +132,50 @@ class AITextService {
       temperature,
     };
 
-    try {
-      // Newer OpenAI models (gpt-5.x and later) reject the legacy max_tokens
-      // parameter with a 400 error and require max_completion_tokens instead.
-      const response = await this.client.chat.completions.create({
-        ...params,
-        max_completion_tokens: maxTokens,
-      });
-      return this._extractContent(response);
-    } catch (error) {
-      // Older models and some providers reject max_completion_tokens with a 400;
-      // retry the same request using the legacy max_tokens spelling.
-      if (
-        error &&
-        error.status === 400 &&
-        /max(_completion)?_tokens/i.test(error.message || '')
-      ) {
-        const response = await this.client.chat.completions.create({
-          ...params,
-          max_tokens: maxTokens,
-        });
+    const tokenParams = [
+      { max_completion_tokens: maxTokens },
+      { max_tokens: maxTokens },
+    ];
+
+    let lastError = null;
+    for (let index = 0; index < tokenParams.length; index++) {
+      const request = { ...params, ...tokenParams[index] };
+      try {
+        const response = await this.client.chat.completions.create(request);
         return this._extractContent(response);
+      } catch (error) {
+        lastError = error;
+        const message = error?.message || '';
+        const unsupportedTemperature =
+          error?.status === 400 &&
+          /temperature/i.test(message) &&
+          /(unsupported value|does not support|only the default)/i.test(message);
+
+        if (unsupportedTemperature) {
+          const { temperature: _temperature, ...withoutTemperature } = request;
+          try {
+            const response = await this.client.chat.completions.create(withoutTemperature);
+            return this._extractContent(response);
+          } catch (retryError) {
+            lastError = retryError;
+          }
+        }
+
+        // Older models and some providers reject max_completion_tokens with a
+        // 400; retry with the legacy max_tokens spelling. This also applies if
+        // the temperature-compatible retry exposed the token incompatibility.
+        if (
+          index === 0 &&
+          lastError?.status === 400 &&
+          /max(_completion)?_tokens/i.test(lastError.message || '')
+        ) {
+          continue;
+        }
+        throw lastError;
       }
-      throw error;
     }
+
+    throw lastError;
   }
 
   _extractContent(response) {

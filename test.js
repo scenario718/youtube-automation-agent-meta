@@ -46,6 +46,7 @@ class SystemTest {
       { name: 'Placeholder Scheduling Guard', test: () => this.testPlaceholderSchedulingGuard() },
       { name: 'FFmpeg Resolution', test: () => this.testFFmpegResolution() },
       { name: 'Gemini Media Provider Selection', test: () => this.testGeminiMediaProvider() },
+      { name: 'Slideshow Duration Selection', test: () => this.testSlideshowDurationSelection() },
       { name: 'Slideshow Renderer', test: () => this.testSlideshowRenderer() },
       { name: 'Evergreen Template Topics', test: () => this.testEvergreenTopics() },
       { name: 'Walkthrough Module', test: () => this.testWalkthroughModule() },
@@ -2427,6 +2428,47 @@ class SystemTest {
       if (legacyResult !== 'legacy-ok') throw new Error('Legacy fallback did not return content');
       if (attempt !== 2) throw new Error('Expected exactly one retry with max_tokens');
 
+      // Some reasoning models reject any explicit non-default temperature. The
+      // request should be retried once without that optional parameter while
+      // preserving the modern token parameter and all other request details.
+      const temperatureCalls = [];
+      service.client.chat.completions.create = async (params) => {
+        temperatureCalls.push(params);
+        if (temperatureCalls.length === 1) {
+          const err = new Error("Unsupported value: 'temperature' does not support 0.2 with this model. Only the default (1) value is supported.");
+          err.status = 400;
+          throw err;
+        }
+        return { choices: [{ message: { content: 'temperature-ok' } }] };
+      };
+      const temperatureResult = await service.generateText('temperature prompt', { maxTokens: 321, temperature: 0.2 });
+      if (temperatureResult !== 'temperature-ok') throw new Error('Temperature fallback did not return content');
+      if (temperatureCalls.length !== 2) throw new Error('Expected exactly one retry without temperature');
+      if (temperatureCalls[0].temperature !== 0.2 || temperatureCalls[0].max_completion_tokens !== 321) {
+        throw new Error('Initial request did not preserve the requested sampling and token parameters');
+      }
+      if ('temperature' in temperatureCalls[1] || temperatureCalls[1].max_completion_tokens !== 321) {
+        throw new Error('Temperature retry must omit only temperature and preserve max_completion_tokens');
+      }
+
+      // Do not hide unrelated 400s merely because their message mentions temperature.
+      let invalidTemperatureAttempts = 0;
+      service.client.chat.completions.create = async () => {
+        invalidTemperatureAttempts++;
+        const err = new Error('temperature must be between 0 and 2');
+        err.status = 400;
+        throw err;
+      };
+      let invalidTemperatureRejected = false;
+      try {
+        await service.generateText('invalid temperature prompt', { temperature: 3 });
+      } catch (error) {
+        invalidTemperatureRejected = /between 0 and 2/i.test(error.message);
+      }
+      if (!invalidTemperatureRejected || invalidTemperatureAttempts !== 1) {
+        throw new Error('Unrelated temperature validation errors must surface without retry');
+      }
+
       // An empty model body must surface as a descriptive error, not the cryptic
       // "Unexpected end of JSON input" the agents used to log.
       service.client.chat.completions.create = async () => ({ choices: [{ message: { content: '' } }] });
@@ -2634,7 +2676,7 @@ class SystemTest {
 
   async testSlideshowRenderer() {
     const { AIVideoGenerator } = require('./utils/ai-video-generator');
-    const { checkFFmpeg } = require('./utils/ffmpeg');
+    const { checkFFmpeg, getMediaDuration } = require('./utils/ffmpeg');
     const fs = require('fs').promises;
     const os = require('os');
 
@@ -2697,6 +2739,10 @@ class SystemTest {
       if (!stats.size) {
         throw new Error('Rendered slideshow video is empty');
       }
+      const renderedDuration = await getMediaDuration(videoPath);
+      if (renderedDuration < 5.8 || renderedDuration > 6.2) {
+        throw new Error(`Crossfades changed the requested 6s slideshow duration to ${renderedDuration}s`);
+      }
 
       // Missing narration must fail closed unless the operator explicitly confirmed silence.
       const finalPath = path.join(dir, 'final.mp4');
@@ -2725,6 +2771,38 @@ class SystemTest {
     }
 
     this.logger.info('Slideshow renderer test completed successfully');
+  }
+
+  async testSlideshowDurationSelection() {
+    const { AIVideoGenerator } = require('./utils/ai-video-generator');
+    const script = {
+      hook: { text: 'Hi.' },
+      introduction: { greeting: '', topicIntro: '' },
+      mainContent: { sections: [] },
+      conclusion: { finalThought: '' }
+    };
+
+    let probedPath = null;
+    const measuredGenerator = new AIVideoGenerator({}, {
+      getMediaDuration: async audioPath => {
+        probedPath = audioPath;
+        return 40;
+      }
+    });
+    const measuredDuration = await measuredGenerator.resolveSlideshowDuration(script, 'narration.mp3');
+    if (probedPath !== 'narration.mp3' || measuredDuration !== 40.5) {
+      throw new Error(`Slideshow duration must use real narration length plus margin; got ${measuredDuration}`);
+    }
+
+    const fallbackGenerator = new AIVideoGenerator({}, {
+      getMediaDuration: async () => { throw new Error('probe unavailable'); }
+    });
+    const fallbackDuration = await fallbackGenerator.resolveSlideshowDuration(script, 'narration.mp3');
+    if (fallbackDuration !== 30) {
+      throw new Error(`Unavailable narration probe must use the 30s script estimate; got ${fallbackDuration}`);
+    }
+
+    this.logger.info('Slideshow duration selection test completed successfully');
   }
 
   async testEvergreenTopics() {
