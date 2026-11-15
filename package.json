@@ -22,6 +22,8 @@
     "meta:auth": "node scripts/meta/meta-auth.js",
     "meta:publish": "node scripts/meta/publish.js",
     "meta:serve-media": "node scripts/meta/serve-media.js",
+    "tiktok:auth": "node scripts/tiktok/tiktok-auth.js",
+    "tiktok:publish": "node scripts/tiktok/publish.js",
     "lint": "eslint ."
   },
   "dependencies": {
